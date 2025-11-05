@@ -6,11 +6,15 @@ import gspread
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import SpreadsheetNotFound, APIError
 
-
+# ===== Google Sheets 基本配置 =====
 SPREADSHEET_NAME = "Massage_Work_Log"  # Google 表格文件名
 SHEET_RECORD = "工时记录"
 SHEET_STAFF = "员工表"
+
+# 如果第一次创建表格，自动共享给你的 Google 邮箱（可选）
+OWNER_EMAIL = "arcse12@gmail.com"  # 如果想共享给自己，可以填 "你的gmail地址"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -46,16 +50,14 @@ def calc_price(duration_min: int) -> float:
 def get_gsheet_client():
     """
     使用 Streamlit Secrets 创建 gspread 客户端。
-    这里假设 secrets 里的 gcp_service_account 是一个 TOML 对象（字典），
-    例如：
-    
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "xxxx"
-    ...
+    假设 secrets 配置为 TOML 对象：
+        [gcp_service_account]
+        type = "service_account"
+        project_id = "xxx"
+        ...
     """
-    raw = st.secrets["gcp_service_account"]   # 这是一个 Mapping / dict
-    creds_info = dict(raw)                    # 直接转成普通字典
+    raw = st.secrets["gcp_service_account"]  # 这是一个 Mapping/dict
+    creds_info = dict(raw)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -63,17 +65,27 @@ def get_gsheet_client():
 def get_or_create_worksheet(title: str):
     """打开指定工作表，不存在就创建并写表头"""
     client = get_gsheet_client()
+
+    # 先打开/创建整个 Spreadsheet
     try:
         sh = client.open(SPREADSHEET_NAME)
-    except gspread.SpreadsheetNotFound:
-        # 如果表格不存在，就创建一个新的
+    except SpreadsheetNotFound:
         sh = client.create(SPREADSHEET_NAME)
+        # 第一次创建时可选共享给你自己的账号
+        try:
+            if OWNER_EMAIL:
+                sh.share(OWNER_EMAIL, perm_type="user", role="writer")
+        except Exception:
+            pass
+    except APIError as e:
+        st.error(f"打开 Google Sheet 出错：{e}")
+        st.stop()
 
+    # 再打开/创建单个 sheet
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows="1000", cols="20")
-        # 新 sheet 写表头
         if title == SHEET_RECORD:
             ws.append_row(COLUMNS)
         elif title == SHEET_STAFF:
@@ -86,7 +98,7 @@ def get_or_create_worksheet(title: str):
 def load_records() -> pd.DataFrame:
     """从 Google Sheets 读取工时记录"""
     ws = get_or_create_worksheet(SHEET_RECORD)
-    records = ws.get_all_records()  # list[dict]
+    records = ws.get_all_records()
     df = pd.DataFrame(records)
 
     if df.empty:
@@ -175,7 +187,7 @@ def make_summary(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-# ------------ 导出相关（仍然导出为本地 Excel） ------------
+# ------------ 导出相关（导出为 Excel） ------------
 
 def to_excel_bytes(detail_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     """导出：当前筛选结果（选定员工+日期）"""
@@ -194,19 +206,16 @@ def to_excel_all_bytes() -> bytes:
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # 先写总表 & 员工表
         summary_df = make_summary(records_df)
         records_df.to_excel(writer, sheet_name="工时记录_全部", index=False)
         summary_df.to_excel(writer, sheet_name="汇总_全部", index=False)
         staff_df.to_excel(writer, sheet_name="员工表", index=False)
 
         if not records_df.empty:
-            # 加一个字段：年月（例如 2025-10）
             date_series = pd.to_datetime(records_df["日期"], errors="coerce")
             tmp = records_df.copy()
             tmp["_ym"] = date_series.dt.strftime("%Y-%m")
 
-            # ===== 月度汇总 Sheet =====
             monthly_summary = (
                 tmp.groupby("_ym")[["服务收入", "小费", "总收入"]]
                 .sum()
@@ -215,11 +224,8 @@ def to_excel_all_bytes() -> bytes:
             )
             monthly_summary.to_excel(writer, sheet_name="月度汇总", index=False)
 
-            # ===== 每个月单独一个 Sheet，末尾加“合计”行 =====
             for ym in sorted(tmp["_ym"].dropna().unique()):
                 month_df = tmp[tmp["_ym"] == ym].drop(columns=["_ym"])
-
-                # 计算本月合计
                 totals = month_df[["服务收入", "小费", "总收入"]].sum()
                 total_row = {col: "" for col in month_df.columns}
                 total_row["日期"] = "合计"
@@ -231,8 +237,6 @@ def to_excel_all_bytes() -> bytes:
                     [month_df, pd.DataFrame([total_row])],
                     ignore_index=True,
                 )
-
-                # sheet 名就是 2025-10 这种
                 month_df_with_total.to_excel(writer, sheet_name=ym, index=False)
 
     output.seek(0)
@@ -244,14 +248,11 @@ def to_excel_all_bytes() -> bytes:
 def page_add_record():
     st.header("➕ 新增 Massage 预约记录")
 
-    # ===== 如果上一次保存成功，在这里显示提示 =====
     success_msg = st.session_state.get("just_saved_msg", "")
     if success_msg:
         st.success(success_msg)
-        # 显示一次后清空
         st.session_state["just_saved_msg"] = ""
 
-    # ===== 数据准备 =====
     records_df = load_records()
     staff_df = load_staff()
 
@@ -260,7 +261,6 @@ def page_add_record():
     )
     staff_list_display = ["（手动输入新员工）"] + staff_list
 
-    # ===== 输入表单 =====
     date_value = st.date_input("日期", value=date.today())
     staff_choice = st.selectbox("员工姓名（可选择或新填）", staff_list_display)
 
@@ -290,16 +290,14 @@ def page_add_record():
         min_value=0.0,
         step=0.5,
         value=0.0,
-        key=f"tip_input_{duration}",  # 防止缓存同值
+        key=f"tip_input_{duration}",
     )
 
-    # ===== 保存按钮 =====
     if st.button("保存记录 ✅"):
         if not staff_name or not client_name:
             st.error("员工姓名 和 客人姓名 不能为空。")
             return
 
-        # 生成新的 ID（自增）
         if not records_df.empty:
             new_id = int(records_df["ID"].max()) + 1
         else:
@@ -319,19 +317,15 @@ def page_add_record():
             "总收入": total_income,
         }
 
-        # 保存到 Google Sheets
         records_df = pd.concat(
             [records_df, pd.DataFrame([record])], ignore_index=True
         )
         ensure_staff_exists(staff_name)
         save_all(records_df)
 
-        # ✅ 保存成功后，把提示信息放入 session_state
         st.session_state["just_saved_msg"] = (
             f"✅ 已保存：ID {new_id} | {staff_name} | {duration}分钟 | 收入 {service_income} + 小费 {tip} = 总 {total_income}"
         )
-
-        # 🔄 刷新页面（重置所有输入，小费恢复为 0）
         st.rerun()
 
 
@@ -345,7 +339,6 @@ def page_summary():
         st.info("目前还没有任何记录。")
         return
 
-    # 筛选
     all_staff = sorted(
         [x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()]
     )
@@ -375,22 +368,16 @@ def page_summary():
     st.subheader("汇总表（当前筛选）")
     st.dataframe(summary_filtered, use_container_width=True)
 
-    # ===== 月度收入统计 =====
     st.markdown("### 💰 月度收入统计（含小费）")
-
-    # 提取年月
     df_filtered["_月份"] = pd.to_datetime(
         df_filtered["日期"], errors="coerce"
     ).dt.strftime("%Y-%m")
-
-    # 按月份汇总收入
     monthly_summary = (
         df_filtered.groupby("_月份")[["服务收入", "小费", "总收入"]]
         .sum()
         .reset_index()
         .rename(columns={"_月份": "月份"})
     )
-
     if not monthly_summary.empty:
         st.dataframe(monthly_summary, use_container_width=True)
     else:
@@ -399,7 +386,6 @@ def page_summary():
     st.subheader("明细表（当前筛选）")
     st.dataframe(df_filtered, use_container_width=True)
 
-    # ---- 导出按钮 ----
     col_dl1, col_dl2 = st.columns(2)
     with col_dl1:
         st.download_button(
@@ -416,7 +402,6 @@ def page_summary():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # ---- 在这里直接修改记录 ----
     st.markdown("---")
     st.subheader("✏ 修改记录（当前筛选范围内）")
 
@@ -426,17 +411,14 @@ def page_summary():
         return
 
     edit_id = st.selectbox("选择要修改的记录 ID", id_options)
-
     row = df_filtered[df_filtered["ID"] == edit_id].iloc[0]
 
-    # 预设值
     edit_date = st.date_input(
         "日期（修改）",
         value=pd.to_datetime(row["日期"]).date(),
         key=f"edit_date_{edit_id}",
     )
 
-    # 员工改名：从员工表选择
     staff_all = sorted(
         [x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()]
     )
@@ -455,7 +437,6 @@ def page_summary():
         key=f"edit_client_{edit_id}",
     )
 
-    # 时长
     dur_options = sorted(set(DURATION_OPTIONS + [int(row["服务时长(分钟)"])]))
     edit_duration = st.selectbox(
         "服务时长（分钟，修改）",
@@ -515,7 +496,6 @@ def page_delete_records():
         st.info("目前还没有任何记录。")
         return
 
-    # 危险操作：全部删除
     st.subheader("⚠ 危险操作：删除全部记录")
     confirm_all = st.checkbox("我真的要删除 *所有* 记录（不可恢复）")
     if confirm_all and st.button("❌ 删除全部记录（不可恢复）"):
@@ -571,11 +551,9 @@ def page_staff_manage():
 
     staff_df = load_staff()
 
-    # ===== 显示当前员工列表 =====
     st.subheader("当前员工列表")
     st.dataframe(staff_df, use_container_width=True)
 
-    # ===== 添加员工 =====
     st.markdown("---")
     st.subheader("➕ 添加新员工")
 
@@ -592,7 +570,6 @@ def page_staff_manage():
             save_staff(staff_df)
             st.success(f"✅ 已添加员工：{name}")
 
-    # ===== 删除员工 =====
     st.markdown("---")
     st.subheader("🗑 删除员工")
 
