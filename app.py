@@ -7,17 +7,7 @@ import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
-# ===== Google Sheets 基本配置 =====
-# 从 Streamlit Secrets 读取 Google 凭证
-creds_json = st.secrets["gcp_service_account"]
-creds_info = json.loads(creds_json)
-creds = Credentials.from_service_account_info(
-    creds_info,
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-)
+
 SPREADSHEET_NAME = "Massage_Work_Log"  # Google 表格文件名
 SHEET_RECORD = "工时记录"
 SHEET_STAFF = "员工表"
