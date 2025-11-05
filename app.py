@@ -1,12 +1,22 @@
-import os
+import json
 from datetime import date
-import pandas as pd
-import streamlit as st
 from io import BytesIO
 
-FILE_NAME = "work_log.xlsx"
+import gspread
+import pandas as pd
+import streamlit as st
+from google.oauth2.service_account import Credentials
+
+# ===== Google Sheets 基本配置 =====
+SERVICE_ACCOUNT_FILE = "massageworklog-e1a9d86791d8.json"  # 你的 JSON 凭证文件名
+SPREADSHEET_NAME = "Massage_Work_Log"  # Google 表格文件名
 SHEET_RECORD = "工时记录"
 SHEET_STAFF = "员工表"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 # 记录表列（加了 ID 方便修改/删除）
 COLUMNS = [
@@ -31,21 +41,48 @@ def calc_price(duration_min: int) -> float:
     return round(duration_min / 60 * 65, 2)
 
 
-# ------------ 读写数据 ------------
+# ------------ Google Sheets 客户端 & 工作表 ------------
+
+@st.cache_resource
+def get_gsheet_client():
+    """根据本地 JSON 凭证创建 gspread 客户端"""
+    creds = Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+
+def get_or_create_worksheet(title: str):
+    """打开指定工作表，不存在就创建并写表头"""
+    client = get_gsheet_client()
+    try:
+        sh = client.open(SPREADSHEET_NAME)
+    except gspread.SpreadsheetNotFound:
+        # 如果表格不存在，就创建一个新的
+        sh = client.create(SPREADSHEET_NAME)
+
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows="1000", cols="20")
+        # 新 sheet 写表头
+        if title == SHEET_RECORD:
+            ws.append_row(COLUMNS)
+        elif title == SHEET_STAFF:
+            ws.append_row(STAFF_COLUMNS)
+    return ws
+
+
+# ------------ 读写工时记录 ------------
 
 def load_records() -> pd.DataFrame:
-    """读取工时记录，如果没有文件就返回空表。自动补齐缺失列 & ID。"""
-    if os.path.exists(FILE_NAME):
-        try:
-            df = pd.read_excel(FILE_NAME, sheet_name=SHEET_RECORD)
-        except Exception:
-            df = pd.DataFrame(columns=COLUMNS)
-    else:
-        df = pd.DataFrame(columns=COLUMNS)
+    """从 Google Sheets 读取工时记录"""
+    ws = get_or_create_worksheet(SHEET_RECORD)
+    records = ws.get_all_records()  # list[dict]
+    df = pd.DataFrame(records)
 
-    # 如果没有 ID 列（老文件），自动生成
-    if "ID" not in df.columns:
-        df.insert(0, "ID", range(1, len(df) + 1))
+    if df.empty:
+        df = pd.DataFrame(columns=COLUMNS)
 
     # 确保所有列存在
     for col in COLUMNS:
@@ -55,37 +92,56 @@ def load_records() -> pd.DataFrame:
             else:
                 df[col] = ""
 
+    # ID 处理
+    df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
+    if df["ID"].isna().all():
+        df["ID"] = range(1, len(df) + 1)
+    else:
+        max_id = int(df["ID"].max()) if not df["ID"].isna().all() else 0
+        for idx, val in df["ID"].items():
+            if pd.isna(val):
+                max_id += 1
+                df.at[idx, "ID"] = max_id
+
+    df["ID"] = df["ID"].astype(int)
+
     return df[COLUMNS]
 
 
+def save_all(records_df: pd.DataFrame):
+    """把工时记录写回 Google Sheets 的“工时记录”工作表"""
+    ws = get_or_create_worksheet(SHEET_RECORD)
+    ws.clear()
+    ws.append_row(COLUMNS)
+    if not records_df.empty:
+        rows = records_df[COLUMNS].astype(object).values.tolist()
+        ws.append_rows(rows)
+
+
+# ------------ 读写员工表 ------------
+
 def load_staff() -> pd.DataFrame:
-    """读取员工表，没有则空表。"""
-    if os.path.exists(FILE_NAME):
-        try:
-            df = pd.read_excel(FILE_NAME, sheet_name=SHEET_STAFF)
-        except Exception:
-            df = pd.DataFrame(columns=STAFF_COLUMNS)
-    else:
+    """从 Google Sheets 读取员工列表"""
+    ws = get_or_create_worksheet(SHEET_STAFF)
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows)
+
+    if df.empty:
         df = pd.DataFrame(columns=STAFF_COLUMNS)
 
     if "员工姓名" not in df.columns:
         df["员工姓名"] = ""
+
     return df[["员工姓名"]]
 
 
 def save_staff(df: pd.DataFrame):
-    """保存员工表到 Excel（自动判断创建/追加）"""
-    if os.path.exists(FILE_NAME):
-        with pd.ExcelWriter(
-            FILE_NAME,
-            engine="openpyxl",
-            mode="a",
-            if_sheet_exists="replace",
-        ) as writer:
-            df.to_excel(writer, sheet_name=SHEET_STAFF, index=False)
-    else:
-        with pd.ExcelWriter(FILE_NAME, engine="openpyxl", mode="w") as writer:
-            df.to_excel(writer, sheet_name=SHEET_STAFF, index=False)
+    """把员工列表写回 Google Sheets 的“员工表”工作表"""
+    ws = get_or_create_worksheet(SHEET_STAFF)
+    ws.clear()
+    ws.append_row(STAFF_COLUMNS)
+    if not df.empty:
+        ws.append_rows(df[STAFF_COLUMNS].astype(object).values.tolist())
 
 
 def ensure_staff_exists(name: str):
@@ -101,21 +157,17 @@ def ensure_staff_exists(name: str):
 def make_summary(df: pd.DataFrame) -> pd.DataFrame:
     """按 日期 + 员工 汇总。"""
     if df.empty:
-        return pd.DataFrame(columns=["日期", "员工姓名", "工时(小时)", "服务收入", "小费", "总收入"])
-    return df.groupby(["日期", "员工姓名"])[["工时(小时)", "服务收入", "小费", "总收入"]].sum().reset_index()
+        return pd.DataFrame(
+            columns=["日期", "员工姓名", "工时(小时)", "服务收入", "小费", "总收入"]
+        )
+    return (
+        df.groupby(["日期", "员工姓名"])[["工时(小时)", "服务收入", "小费", "总收入"]]
+        .sum()
+        .reset_index()
+    )
 
 
-def save_all(records_df: pd.DataFrame):
-    """把：工时记录 + 总汇总 + 员工表 一起写进 work_log.xlsx"""
-    staff_df = load_staff()
-    summary_df = make_summary(records_df)
-    with pd.ExcelWriter(FILE_NAME, engine="openpyxl", mode="w") as writer:
-        records_df.to_excel(writer, sheet_name=SHEET_RECORD, index=False)
-        summary_df.to_excel(writer, sheet_name="汇总_按日期员工", index=False)
-        staff_df.to_excel(writer, sheet_name=SHEET_STAFF, index=False)
-
-
-# ------------ 导出相关 ------------
+# ------------ 导出相关（仍然导出为本地 Excel） ------------
 
 def to_excel_bytes(detail_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     """导出：当前筛选结果（选定员工+日期）"""
@@ -179,7 +231,6 @@ def to_excel_all_bytes() -> bytes:
     return output.read()
 
 
-
 # ------------ 页面：新增记录 ------------
 
 def page_add_record():
@@ -196,7 +247,9 @@ def page_add_record():
     records_df = load_records()
     staff_df = load_staff()
 
-    staff_list = sorted([x for x in staff_df["员工姓名"].dropna().unique().tolist() if str(x).strip()])
+    staff_list = sorted(
+        [x for x in staff_df["员工姓名"].dropna().unique().tolist() if str(x).strip()]
+    )
     staff_list_display = ["（手动输入新员工）"] + staff_list
 
     # ===== 输入表单 =====
@@ -258,8 +311,10 @@ def page_add_record():
             "总收入": total_income,
         }
 
-        # 保存到 Excel
-        records_df = pd.concat([records_df, pd.DataFrame([record])], ignore_index=True)
+        # 保存到 Google Sheets
+        records_df = pd.concat(
+            [records_df, pd.DataFrame([record])], ignore_index=True
+        )
         ensure_staff_exists(staff_name)
         save_all(records_df)
 
@@ -270,7 +325,6 @@ def page_add_record():
 
         # 🔄 刷新页面（重置所有输入，小费恢复为 0）
         st.rerun()
-
 
 
 # ------------ 页面：汇总统计（可修改记录） ------------
@@ -284,7 +338,9 @@ def page_summary():
         return
 
     # 筛选
-    all_staff = sorted([x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()])
+    all_staff = sorted(
+        [x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()]
+    )
     staff_filter = st.multiselect("筛选员工（可多选）", all_staff, default=all_staff)
 
     date_series = pd.to_datetime(df_all["日期"], errors="coerce")
@@ -311,11 +367,13 @@ def page_summary():
     st.subheader("汇总表（当前筛选）")
     st.dataframe(summary_filtered, use_container_width=True)
 
-        # ===== 月度收入统计 =====
+    # ===== 月度收入统计 =====
     st.markdown("### 💰 月度收入统计（含小费）")
 
     # 提取年月
-    df_filtered["_月份"] = pd.to_datetime(df_filtered["日期"], errors="coerce").dt.strftime("%Y-%m")
+    df_filtered["_月份"] = pd.to_datetime(
+        df_filtered["日期"], errors="coerce"
+    ).dt.strftime("%Y-%m")
 
     # 按月份汇总收入
     monthly_summary = (
@@ -370,8 +428,10 @@ def page_summary():
         key=f"edit_date_{edit_id}",
     )
 
-    # 员工改名：从员工表选择（如果想新增名字，可去“员工管理”页面先添加）
-    staff_all = sorted([x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()])
+    # 员工改名：从员工表选择
+    staff_all = sorted(
+        [x for x in df_all["员工姓名"].dropna().unique().tolist() if str(x).strip()]
+    )
     if row["员工姓名"] not in staff_all:
         staff_all.append(row["员工姓名"])
     edit_staff = st.selectbox(
@@ -459,7 +519,9 @@ def page_delete_records():
     st.markdown("---")
     st.subheader("按条件删除部分记录")
 
-    all_staff = sorted([x for x in df["员工姓名"].dropna().unique().tolist() if str(x).strip()])
+    all_staff = sorted(
+        [x for x in df["员工姓名"].dropna().unique().tolist() if str(x).strip()]
+    )
     staff_filter = st.multiselect("先筛选员工（可多选）", all_staff, default=all_staff)
 
     date_series = pd.to_datetime(df["日期"], errors="coerce")
@@ -516,7 +578,9 @@ def page_staff_manage():
         elif name in staff_df["员工姓名"].astype(str).tolist():
             st.warning("该员工已存在。")
         else:
-            staff_df = pd.concat([staff_df, pd.DataFrame([{"员工姓名": name}])], ignore_index=True)
+            staff_df = pd.concat(
+                [staff_df, pd.DataFrame([{"员工姓名": name}])], ignore_index=True
+            )
             save_staff(staff_df)
             st.success(f"✅ 已添加员工：{name}")
 
@@ -538,7 +602,6 @@ def page_staff_manage():
                 st.success(f"已删除员工：{', '.join(staff_to_delete)}")
     else:
         st.info("当前还没有员工。")
-
 
 
 # ------------ 主入口 ------------
