@@ -48,18 +48,18 @@ def calc_price(duration_min: int) -> float:
 
 @st.cache_resource
 def get_gsheet_client():
-    """
-    使用 Streamlit Secrets 创建 gspread 客户端。
-    假设 secrets 配置为 TOML 对象：
-        [gcp_service_account]
-        type = "service_account"
-        project_id = "xxx"
-        ...
-    """
-    raw = st.secrets["gcp_service_account"]  # 这是一个 Mapping/dict
-    creds_info = dict(raw)
+    raw = st.secrets["gcp_service_account"]
+
+    if isinstance(raw, str):
+        # 写法 1：JSON 字符串
+        creds_info = json.loads(raw)
+    else:
+        # 写法 2：TOML 对象（Mapping）
+        creds_info = dict(raw)
+
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return gspread.authorize(creds)
+
 
 
 def get_or_create_worksheet(title: str):
