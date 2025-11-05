@@ -1,4 +1,3 @@
-import json
 from datetime import date
 from io import BytesIO
 
@@ -48,25 +47,6 @@ def calc_price(duration_min: int) -> float:
 
 @st.cache_resource
 def get_gsheet_client():
-    """
-    使用 Streamlit Secrets 创建 gspread 客户端。
-
-    这里假设 .streamlit/secrets.toml 里有：
-
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "massageworklog"
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-    client_email = "streamlit-worklog@massageworklog.iam.gserviceaccount.com"
-    client_id = "..."
-    auth_uri = "https://accounts.google.com/o/oauth2/auth"
-    token_uri = "https://oauth2.googleapis.com/token"
-    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-    client_x509_cert_url = "..."
-    universe_domain = "googleapis.com"
-    """
-    # st.secrets["gcp_service_account"] 本身就是一个 dict-like
     creds_info = dict(st.secrets["gcp_service_account"])
 
     creds = Credentials.from_service_account_info(
@@ -109,10 +89,24 @@ def get_or_create_worksheet(title: str):
 
 # ------------ 读写工时记录 ------------
 
+@st.cache_data(ttl=30)
 def load_records() -> pd.DataFrame:
-    """从 Google Sheets 读取工时记录"""
+    """从 Google Sheets 读取工时记录（带缓存，减少配额压力）"""
     ws = get_or_create_worksheet(SHEET_RECORD)
-    records = ws.get_all_records()
+
+    try:
+        records = ws.get_all_records()
+    except APIError as e:
+        # 如果是配额问题，给出更友好的提示
+        if "Quota exceeded for quota metric 'Read requests'" in str(e):
+            st.error(
+                "⚠️ Google Sheets 读请求太频繁，当前项目的配额被用完了。\n\n"
+                "请稍等一会再试，或减少频繁刷新 / 操作次数。"
+            )
+            st.stop()
+        else:
+            raise
+
     df = pd.DataFrame(records)
 
     if df.empty:
@@ -151,13 +145,29 @@ def save_all(records_df: pd.DataFrame):
         rows = records_df[COLUMNS].astype(object).values.tolist()
         ws.append_rows(rows)
 
+    # 写入后清除缓存，下次读取会重新请求 Google Sheets
+    load_records.clear()
+
 
 # ------------ 读写员工表 ------------
 
+@st.cache_data(ttl=30)
 def load_staff() -> pd.DataFrame:
-    """从 Google Sheets 读取员工列表"""
+    """从 Google Sheets 读取员工列表（带缓存）"""
     ws = get_or_create_worksheet(SHEET_STAFF)
-    rows = ws.get_all_records()
+
+    try:
+        rows = ws.get_all_records()
+    except APIError as e:
+        if "Quota exceeded for quota metric 'Read requests'" in str(e):
+            st.error(
+                "⚠️ Google Sheets 读请求太频繁，当前项目的配额被用完了。\n\n"
+                "请稍等一会再试，或减少频繁刷新 / 操作次数。"
+            )
+            st.stop()
+        else:
+            raise
+
     df = pd.DataFrame(rows)
 
     if df.empty:
@@ -176,6 +186,9 @@ def save_staff(df: pd.DataFrame):
     ws.append_row(STAFF_COLUMNS)
     if not df.empty:
         ws.append_rows(df[STAFF_COLUMNS].astype(object).values.tolist())
+
+    # 写入后清除缓存
+    load_staff.clear()
 
 
 def ensure_staff_exists(name: str):
