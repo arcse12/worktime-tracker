@@ -50,23 +50,30 @@ def calc_price(duration_min: int) -> float:
 def get_gsheet_client():
     """
     使用 Streamlit Secrets 创建 gspread 客户端。
-    这里假设 secrets 里的 gcp_service_account 是 JSON 字符串，例如：
 
-    gcp_service_account = \"\"\"{ ... }\"\"\"
+    这里假设 .streamlit/secrets.toml 里有：
+
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "massageworklog"
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "streamlit-worklog@massageworklog.iam.gserviceaccount.com"
+    client_id = "..."
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+    client_x509_cert_url = "..."
+    universe_domain = "googleapis.com"
     """
-    creds_json = st.secrets["gcp_service_account"]      # 这是一个 str
-    creds_info = json.loads(creds_json)                 # 解析 JSON 得到 dict
+    # st.secrets["gcp_service_account"] 本身就是一个 dict-like
+    creds_info = dict(st.secrets["gcp_service_account"])
 
     creds = Credentials.from_service_account_info(
         creds_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=SCOPES,
     )
     return gspread.authorize(creds)
-
-
 
 
 def get_or_create_worksheet(title: str):
@@ -331,7 +338,8 @@ def page_add_record():
         save_all(records_df)
 
         st.session_state["just_saved_msg"] = (
-            f"✅ 已保存：ID {new_id} | {staff_name} | {duration}分钟 | 收入 {service_income} + 小费 {tip} = 总 {total_income}"
+            f"✅ 已保存：ID {new_id} | {staff_name} | {duration}分钟 | "
+            f"收入 {service_income} + 小费 {tip} = 总 {total_income}"
         )
         st.rerun()
 
@@ -352,6 +360,10 @@ def page_summary():
     staff_filter = st.multiselect("筛选员工（可多选）", all_staff, default=all_staff)
 
     date_series = pd.to_datetime(df_all["日期"], errors="coerce")
+    if date_series.isna().all():
+        st.error("所有日期都无效，请检查表格中的“日期”格式。")
+        return
+
     min_date, max_date = date_series.min().date(), date_series.max().date()
     date_range = st.date_input("日期范围", value=(min_date, max_date))
 
@@ -520,6 +532,10 @@ def page_delete_records():
     staff_filter = st.multiselect("先筛选员工（可多选）", all_staff, default=all_staff)
 
     date_series = pd.to_datetime(df["日期"], errors="coerce")
+    if date_series.isna().all():
+        st.error("所有日期都无效，请检查表格中的“日期”格式。")
+        return
+
     min_date, max_date = date_series.min().date(), date_series.max().date()
     date_range = st.date_input("日期范围", value=(min_date, max_date))
 
