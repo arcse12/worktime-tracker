@@ -48,17 +48,24 @@ def calc_price(duration_min: int) -> float:
 
 @st.cache_resource
 def get_gsheet_client():
-    raw = st.secrets["gcp_service_account"]
+    """
+    使用 Streamlit Secrets 创建 gspread 客户端。
+    这里假设 secrets 里的 gcp_service_account 是 JSON 字符串，例如：
 
-    if isinstance(raw, str):
-        # 写法 1：JSON 字符串
-        creds_info = json.loads(raw)
-    else:
-        # 写法 2：TOML 对象（Mapping）
-        creds_info = dict(raw)
+    gcp_service_account = \"\"\"{ ... }\"\"\"
+    """
+    creds_json = st.secrets["gcp_service_account"]      # 这是一个 str
+    creds_info = json.loads(creds_json)                 # 解析 JSON 得到 dict
 
-    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    creds = Credentials.from_service_account_info(
+        creds_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
     return gspread.authorize(creds)
+
 
 
 
